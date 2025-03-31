@@ -1,14 +1,16 @@
 import streamlit as st
 from feature_selection import feature_selection_screen
 
-# ====== Configurações Gerais ======
+# ============ Configurações ============
+
 st.set_page_config(
     page_title="🏦 CashMe - Feature Selection",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ====== Tela de Login ======
+# ============ Tela de Login ============
+
 def login():
     st.title("🏦 Desafio CashMe - Seleção de Variáveis")
     st.subheader("🔐 Acesso Restrito")
@@ -21,12 +23,11 @@ def login():
         if submit:
             if username == "cashme123" and password == "cashme123":
                 st.session_state["authenticated"] = True
-                st.success("Login realizado com sucesso!")
-                st.experimental_rerun()
             else:
                 st.error("Usuário ou senha inválidos!")
 
-# ====== Execução Principal ======
+# ============ Execução Principal ============
+
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
