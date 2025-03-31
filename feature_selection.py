@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from pathlib import Path
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.decomposition import PCA
@@ -102,11 +102,16 @@ def feature_selection_screen():
     df = encode_categoricals(df)
     df = create_derived_features(df)
 
-    st.subheader("🔍 Preview do Dataset")
+    st.subheader("🔍 Preview do Dataset com Variáveis Derivadas")
     st.dataframe(df.head())
 
-    X = df.drop(columns=["Target"])
-    y = df["Target"]
+    # Amostragem estratificada
+    st.subheader("📊 Amostragem para Acelerar Processamento")
+    sample_size = st.slider("Selecione o número de amostras para modelagem", 1000, min(10000, len(df)), 3000, step=500)
+    df_sampled, _ = train_test_split(df, stratify=df["Target"], train_size=sample_size, random_state=42)
+
+    X = df_sampled.drop(columns=["Target"])
+    y = df_sampled["Target"]
 
     # Remove colunas com apenas um valor (zero variância)
     X = X.loc[:, X.nunique() > 1]
@@ -121,11 +126,11 @@ def feature_selection_screen():
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X, y)
 
-    st.subheader("📊 Seleção de Variáveis com LightGBM")
+    st.subheader("📌 Seleção de Variáveis com Importância Média (LGBM)")
     selector = SelectFromModel(model, threshold="mean", prefit=True)
     selected_mask = selector.get_support()
     selected_features = X.columns[selected_mask]
-    st.write("Variáveis selecionadas:", list(selected_features))
+    st.write("✅ Variáveis selecionadas:", list(selected_features))
 
     df_selected = X[selected_features].copy()
     df_selected["Target"] = y.values
@@ -134,8 +139,8 @@ def feature_selection_screen():
     try:
         st.subheader("🧬 PCA - Redução de Dimensionalidade")
         scaler = StandardScaler()
-        pca = PCA(n_components=2)
         X_scaled = scaler.fit_transform(df_selected.drop(columns=["Target"]))
+        pca = PCA(n_components=2)
         X_pca = pca.fit_transform(X_scaled)
         pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
         pca_df["Target"] = y.values
@@ -148,13 +153,19 @@ def feature_selection_screen():
     try:
         explainer = shap.Explainer(model, df_selected.drop(columns=["Target"]))
         shap_values = explainer(df_selected.drop(columns=["Target"]))
-        st.set_option('deprecation.showPyplotGlobalUse', False)
+
+        fig = plt.figure()
         shap.summary_plot(shap_values, df_selected.drop(columns=["Target"]), plot_type="bar", show=False)
-        st.pyplot()
+        plt.tight_layout()
+        plt.savefig("shap_values.png")
+        st.pyplot(fig)
+
+        with open("shap_values.png", "rb") as f:
+            st.download_button("📥 Baixar Gráfico SHAP", f, file_name="shap_values.png")
     except Exception as e:
         st.warning(f"Erro ao gerar SHAP: {e}")
 
-    # Download dos resultados
-    st.subheader("📥 Baixar resultado")
+    # Download do CSV final
+    st.subheader("📄 Baixar CSV com Features Selecionadas")
     csv = df_selected.to_csv(index=False).encode('utf-8')
-    st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
+    st.download_button("📁 Baixar CSV", data=csv, file_name="selected_features.csv")
