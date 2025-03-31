@@ -4,63 +4,47 @@ import shap
 import optuna
 import lightgbm as lgb
 import matplotlib.pyplot as plt
-import seaborn as sns
 import streamlit as st
 
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from pathlib import Path
+from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
-from pathlib import Path
-from scipy.stats import entropy
 
-# ======================================
-# UTILS
-# ======================================
-def load_data():
-    X = pd.read_csv("X.csv", index_col=0)
-    y = pd.read_csv("y.csv", index_col=0)
-    df = X.copy()
-    df["Target"] = y["Target"]
-    return df
+# ========= Funções utilitárias =========
 
-
-def encode_categoricals(df):
+def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in df.select_dtypes(include=["object", "bool", "category"]).columns:
+    for col in df.select_dtypes(include=["object", "category"]).columns:
         try:
             df[col] = df[col].astype(str)
             df[col] = LabelEncoder().fit_transform(df[col])
-        except:
+        except Exception as e:
+            st.warning(f"Erro ao codificar '{col}': {e}")
             df[col] = 0
     return df
 
 
-def generate_feature_engineering(df):
+def create_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in df.columns:
-        if col == "Target":
-            continue
 
-        series = df[col]
+    # Entropia
+    def entropy(col):
+        p_data = col.value_counts() / len(col)
+        return -sum(p_data * np.log2(p_data + 1e-9))
 
-        if pd.api.types.is_numeric_dtype(series):
-            df[f"{col}_lag"] = series.shift(1).fillna(0)
-            df[f"{col}_lag_diff"] = df[col] - df[f"{col}_lag"]
-            df[f"{col}_normalized"] = (series - series.mean()) / (series.std() + 1e-6)
+    for col in df.select_dtypes(include=[np.number]).columns:
+        df[f"{col}_lag1"] = df[col].shift(1).fillna(0)
+        df[f"{col}_diff"] = df[col] - df[f"{col}_lag1"]
+        df[f"{col}_score"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
+        df[f"{col}_entropy"] = entropy(df[col])
 
-            # Entropia (para colunas discretas apenas)
-            if series.nunique() < 100:
-                counts = series.value_counts()
-                df[f"{col}_entropy"] = entropy(counts, base=2)
-            else:
-                df[f"{col}_entropy"] = 0
-    df = df.fillna(0)
     return df
 
 
-def optimize_lgbm(X, y, n_trials=20):
+def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     def objective(trial):
         params = {
             "objective": "binary",
@@ -75,67 +59,93 @@ def optimize_lgbm(X, y, n_trials=20):
             "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
             "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
         }
-
         model = lgb.LGBMClassifier(**params)
-        score = cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
-        return score
+        return cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
 
 
-# ======================================
-# FEATURE SELECTION SCREEN
-# ======================================
+def load_data() -> pd.DataFrame:
+    st.subheader("📂 Upload dos Arquivos de Entrada")
+
+    x_file = st.file_uploader("Selecione o arquivo de variáveis (X.csv)", type=["csv"])
+    y_file = st.file_uploader("Selecione o arquivo de target (y.csv)", type=["csv"])
+
+    if not x_file or not y_file:
+        st.stop()
+
+    X = pd.read_csv(x_file, index_col=0)
+    y = pd.read_csv(y_file, index_col=0)
+
+    df = X.copy()
+    df["Target"] = y.values.ravel()
+
+    return df
+
+
 def feature_selection_screen():
-    st.title("🏦 Desafio CashMe - Feature Selection")
-
     df = load_data()
-    st.subheader("📊 Amostra dos Dados")
-    st.dataframe(df.sample(5))
 
-    if st.button("Selecionar Features"):
-        with st.spinner("🔍 Executando pré-processamento..."):
-            df = encode_categoricals(df)
-            df = generate_feature_engineering(df)
+    if df.empty:
+        st.warning("O dataset está vazio ou não foi carregado corretamente.")
+        return
 
-        X = df.drop(columns=["Target"])
-        y = df["Target"]
+    df = encode_categoricals(df)
+    df = create_derived_features(df)
 
-        with st.spinner("⚙️ Otimizando LightGBM..."):
-            best_params = optimize_lgbm(X, y, n_trials=20)
-            model = lgb.LGBMClassifier(**best_params)
-            model.fit(X, y)
+    st.subheader("🔍 Preview do Dataset")
+    st.dataframe(df.head())
 
-        with st.spinner("📈 Analisando SHAP Values..."):
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X)[1]  # Para classe 1
-            shap.summary_plot(shap_values, X, plot_type="bar", show=False)
-            plt.tight_layout()
-            Path("outputs").mkdir(exist_ok=True)
-            plt.savefig("outputs/shap_summary.png")
-            plt.close()
+    X = df.drop(columns=["Target"])
+    y = df["Target"]
 
-        st.image("outputs/shap_summary.png", caption="Importância das Features (SHAP)")
+    st.subheader("⚙️ Otimizando parâmetros do LightGBM com Optuna...")
+    with st.spinner("Otimizando parâmetros..."):
+        best_params = optimize_lgbm(X, y, n_trials=30)
 
-        with st.spinner("📦 Selecionando Features mais Relevantes..."):
-            selector = SelectFromModel(model, threshold="mean", prefit=True)
-            selected_features = X.columns[selector.get_support()]
-            df_selected = df[selected_features.tolist() + ["Target"]]
-            df_selected.to_csv("outputs/selected_features.csv", index=False)
+    st.success("✅ Otimização concluída!")
+    st.json(best_params)
 
-            st.success(f"✅ {len(selected_features)} features selecionadas.")
-            st.dataframe(selected_features)
+    model = lgb.LGBMClassifier(**best_params)
+    model.fit(X, y)
 
-        with st.spinner("📉 PCA - Redução de Dimensionalidade"):
-            X_scaled = StandardScaler().fit_transform(X.select_dtypes(include=[np.number]))
-            pca = PCA(n_components=2)
-            X_pca = pca.fit_transform(X_scaled)
-            fig, ax = plt.subplots()
-            scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='coolwarm', alpha=0.5)
-            legend1 = ax.legend(*scatter.legend_elements(), title="Target")
-            ax.add_artist(legend1)
-            st.pyplot(fig)
+    st.subheader("📊 Seleção de Variáveis com LightGBM")
+    selector = SelectFromModel(model, threshold="mean", prefit=True)
+    selected_mask = selector.get_support()
+    selected_features = X.columns[selected_mask]
+    st.write("Variáveis selecionadas:", list(selected_features))
 
-        st.success("🎉 Processo concluído com sucesso!")
+    df_selected = X[selected_features].copy()
+    df_selected["Target"] = y.values
+
+    # PCA
+    try:
+        st.subheader("🧬 PCA - Redução de Dimensionalidade")
+        scaler = StandardScaler()
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(scaler.fit_transform(df_selected.drop(columns=["Target"])))
+        pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
+        pca_df["Target"] = y.values
+
+        st.scatter_chart(pca_df, x="PC1", y="PC2", color="Target")
+    except Exception as e:
+        st.warning(f"Erro na PCA: {e}")
+
+    # SHAP Plot
+    st.subheader("🌟 SHAP - Interpretação do Modelo")
+    try:
+        explainer = shap.Explainer(model, X[selected_features])
+        shap_values = explainer(X[selected_features])
+        st.set_option('deprecation.showPyplotGlobalUse', False)
+        shap.summary_plot(shap_values, X[selected_features], plot_type="bar", show=False)
+        st.pyplot()
+    except Exception as e:
+        st.warning(f"Erro ao gerar SHAP: {e}")
+
+    # Download dos resultados
+    st.subheader("📥 Baixar resultado")
+    csv = df_selected.to_csv(index=False).encode('utf-8')
+    st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
+
