@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from pathlib import Path
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.decomposition import PCA
 
-# ========= Utilitários =========
+# ========== Utils ==========
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -26,37 +26,29 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def entropy(col):
-    p_data = col.value_counts(normalize=True)
-    return -np.sum(p_data * np.log2(p_data + 1e-9))
-
-
 def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    def entropy(col):
+        p_data = col.value_counts(normalize=True)
+        return -np.sum(p_data * np.log2(p_data + 1e-9))
+
+    derived_df = pd.DataFrame(index=df.index)
 
     for col in df.select_dtypes(include=[np.number]).columns:
         if col == "Target":
             continue
-
         try:
-            # Razões com os 5 valores anteriores
-            ratios = []
-            for i in range(1, 6):
-                shifted = df[col].shift(i).replace(0, np.nan)
-                ratio = df[col] / shifted
-                ratio = ratio.replace([np.inf, -np.inf], np.nan).fillna(1)
-                ratios.append(ratio)
-
-            # Score baseado em média das razões e entropia
-            ratio_mean = np.mean(ratios, axis=0)
-            score = (ratio_mean - ratio_mean.mean()) / (ratio_mean.std() + 1e-6)
-            entropy_value = entropy(df[col])
-            df[f"{col}_score"] = score * entropy_value
-
+            col_entropy = entropy(df[col])
+            for lag in range(1, 6):
+                ratio = df[col] / (df[col].shift(lag) + 1e-9)
+                ratio.fillna(0, inplace=True)
+                score_col = (ratio - ratio.mean()) / (ratio.std() + 1e-6)
+                derived_df[f"{col}_score_lag{lag}"] = score_col * col_entropy
         except Exception as e:
-            st.warning(f"Erro ao calcular score de '{col}': {e}")
-
-    return df
+            st.warning(f"Erro ao criar score para '{col}': {e}")
+    
+    return derived_df
 
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
@@ -103,7 +95,7 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-# ========= Pipeline Principal =========
+# ========== Main Feature Selection Pipeline ==========
 
 def feature_selection_screen():
     df = load_data()
@@ -113,17 +105,25 @@ def feature_selection_screen():
         return
 
     df = encode_categoricals(df)
-    df = create_score_features(df)
+    derived = create_score_features(df)
 
-    # Amostragem de 500 registros
-    df = df.sample(n=500, random_state=42).reset_index(drop=True)
+    derived["Target"] = df["Target"]
 
-    st.subheader("🔍 Preview do Dataset")
-    st.dataframe(df.head())
+    # Amostragem estratificada com 100 registros
+    df_sampled = derived.copy()
+    try:
+        df_sampled, _ = train_test_split(derived, stratify=derived["Target"], test_size=(1 - 100 / len(derived)), random_state=42)
+    except:
+        st.warning("Amostragem estratificada falhou. Usando o conjunto completo.")
 
-    original_cols = [col for col in df.columns if col.endswith("_score")]
-    X = df[original_cols]
-    y = df["Target"]
+    st.subheader("🔍 Preview do Dataset Amostrado")
+    st.dataframe(df_sampled.head())
+
+    X = df_sampled.drop(columns=["Target"])
+    y = df_sampled["Target"]
+
+    # Remove colunas com apenas um valor (zero variância)
+    X = X.loc[:, X.nunique() > 1]
 
     st.subheader("⚙️ Otimizando parâmetros do LightGBM com Optuna...")
     with st.spinner("Otimizando parâmetros..."):
@@ -149,7 +149,8 @@ def feature_selection_screen():
         st.subheader("🧬 PCA - Redução de Dimensionalidade")
         scaler = StandardScaler()
         pca = PCA(n_components=2)
-        X_pca = pca.fit_transform(scaler.fit_transform(df_selected.drop(columns=["Target"])))
+        X_scaled = scaler.fit_transform(df_selected.drop(columns=["Target"]))
+        X_pca = pca.fit_transform(X_scaled)
         pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
         pca_df["Target"] = y.values
         st.scatter_chart(pca_df, x="PC1", y="PC2", color="Target")
@@ -167,7 +168,7 @@ def feature_selection_screen():
     except Exception as e:
         st.warning(f"Erro ao gerar SHAP: {e}")
 
-    # Exportações
+    # Download dos resultados
     st.subheader("📥 Baixar resultado")
-    csv = df_selected.to_csv(index=False).encode("utf-8")
+    csv = df_selected.to_csv(index=False).encode('utf-8')
     st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
