@@ -11,17 +11,11 @@ st.title("🏦 Desafio CashMe - Seleção de Variáveis com Machine Learning")
 
 with st.sidebar:
     st.header("⚙️ Configurações")
-    st.markdown("""
-        Este aplicativo permite a **seleção automática de variáveis** com base em técnicas avançadas de ML.
+    st.markdown("Este aplicativo realiza a **seleção automática das 50 variáveis mais relevantes** com base em técnicas de ML.")
+    st.markdown("- Engenharia de atributos (Score)\n"
+                "- Amostragem estratificada\n"
+                "- Otimização com Optuna\n"
+                "- Modelo LightGBM\n"
+                "- Visualização de importância")
 
-        🔍 Pipeline:
-        - Criação de variáveis derivadas (scores)
-        - Amostragem estratificada
-        - Otimização com Optuna
-        - Seleção com LightGBM
-        - Interpretação com SHAP
-        - Exportação de variáveis selecionadas
-    """)
-
-# Executa o pipeline principal
 feature_selection_screen()
