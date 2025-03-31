@@ -94,3 +94,42 @@ def select_features_with_lgbm(df: pd.DataFrame, output_dir: str = "outputs") -> 
     df_selected.to_csv(f"{output_dir}/selected_features.csv", index=False)
 
     return df_selected, selected_features.tolist()
+
+import streamlit as st
+import base64
+import io
+
+def feature_selection_screen():
+    st.title("📊 Seleção de Variáveis com LightGBM + Optuna")
+
+    uploaded_file = st.file_uploader("📁 Faça upload de um arquivo CSV com a coluna 'Target'", type="csv")
+    if uploaded_file is None:
+        st.info("Por favor, envie um arquivo para continuar.")
+        return
+
+    df = pd.read_csv(uploaded_file)
+    if "Target" not in df.columns:
+        st.error("O arquivo precisa conter uma coluna chamada 'Target'.")
+        return
+
+    st.success("Arquivo carregado com sucesso! Iniciando seleção de features...")
+
+    with st.spinner("Executando seleção... isso pode levar um tempo..."):
+        selected_df, selected_cols = select_features_with_lgbm(df)
+
+    st.subheader("✅ Features Selecionadas:")
+    st.write(selected_cols)
+
+    st.subheader("📈 Gráfico de Importância SHAP:")
+    shap_path = Path("outputs/shap_values.png")
+    if shap_path.exists():
+        st.image(str(shap_path))
+    else:
+        st.warning("Gráfico SHAP não encontrado.")
+
+    st.subheader("📥 Download dos Dados com Features Selecionadas:")
+    csv = selected_df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="selected_features.csv">Clique para baixar</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
