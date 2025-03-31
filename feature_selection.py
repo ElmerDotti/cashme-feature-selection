@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 
 from io import BytesIO
 from sklearn.model_selection import StratifiedShuffleSplit, cross_val_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_selection import SelectFromModel
-from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score
 
 # ========== Utilitários ==========
 
@@ -107,53 +107,53 @@ def feature_selection_screen():
 
     df = encode_categoricals(df)
 
-    # Engenharia de features + Score
+    # Engenharia de Atributos
     df_scores = create_score_features(df)
     df_scores["Target"] = df["Target"].values
 
     # Amostragem Estratificada
     df_sampled = stratified_sample(df_scores, target_col="Target", sample_size=50)
 
-    st.subheader("🔍 Amostra dos Scores Calculados")
-    st.dataframe(df_sampled.head(10))
+    st.subheader("🔍 Dataset de Entrada (Scores)")
+    st.dataframe(df_sampled.drop(columns=["Target"]).head())
 
     X = df_sampled.drop(columns=["Target"])
     y = df_sampled["Target"]
 
-    # Otimização LightGBM
+    # Otimização
     st.subheader("⚙️ Otimizando modelo com Optuna...")
     with st.spinner("Otimizando..."):
         best_params = optimize_lgbm(X, y, n_trials=20)
     st.success("✅ Otimização concluída!")
     st.json(best_params)
 
-    # Treinamento
+    # Modelo final com parâmetros otimizados
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X, y)
 
-    # Seleção de Variáveis
-    st.subheader("📊 Variáveis Selecionadas com LightGBM")
+    # Seleção de Variáveis com Modelo Otimizado
+    st.subheader("📊 Seleção de Variáveis com LightGBM")
     selector = SelectFromModel(model, threshold="mean", prefit=True)
     selected_features = X.columns[selector.get_support()]
-    st.write("Variáveis Selecionadas:", list(selected_features))
+    st.write(f"✅ {len(selected_features)} variáveis selecionadas:")
+    st.code(list(selected_features))
 
-    df_selected = df_sampled[selected_features].copy()
+    df_selected = X[selected_features].copy()
     df_selected["Target"] = y.values
 
-    # SHAP Plot
+    # SHAP Value
     st.subheader("🌟 SHAP - Interpretação do Modelo")
     try:
-        explainer = shap.Explainer(model, df_selected[selected_features])
-        shap_values = explainer(df_selected[selected_features])
+        explainer = shap.Explainer(model, X[selected_features])
+        shap_values = explainer(X[selected_features])
 
-        st.set_option('deprecation.showPyplotGlobalUse', False)
         fig, ax = plt.subplots(figsize=(10, 6))
-        shap.summary_plot(shap_values, df_selected[selected_features], plot_type="bar", show=False)
+        shap.summary_plot(shap_values, X[selected_features], plot_type="bar", show=False)
         st.pyplot(fig)
     except Exception as e:
         st.warning(f"Erro ao gerar gráfico SHAP: {e}")
 
-    # Download CSV
+    # CSV Download
     st.subheader("📥 Baixar Resultado")
     csv_buffer = BytesIO()
     df_selected.to_csv(csv_buffer, index=False)
