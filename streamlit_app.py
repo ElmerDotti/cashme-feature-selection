@@ -1,11 +1,19 @@
 import streamlit as st
 from feature_selection import feature_selection_screen
 
-# Título do App
-st.set_page_config(page_title="🏦 Desafio CashMe - Feature Selection", layout="wide")
+st.set_page_config(page_title="🏦 CashMe Feature Selection", layout="wide")
 
-st.title("🏦 Desafio CashMe - Feature Selection")
-st.write("Este aplicativo permite realizar seleção de variáveis com técnicas avançadas de machine learning.")
+st.title("🏦 Desafio CashMe - Feature Selection com LightGBM + SHAP")
+st.markdown("""
+Este aplicativo permite:
 
-# Rodar a interface principal
+- 📂 Carregar arquivos de entrada `X.csv` e `y.csv`
+- 🧠 Criar variáveis derivadas automaticamente
+- ⚙️ Otimizar o modelo LightGBM via Optuna
+- 📌 Selecionar as melhores features com base na importância média
+- 🌟 Interpretar os resultados com SHAP
+- 📥 Baixar os resultados como CSV e PNG
+""")
+
+# Executa a tela principal
 feature_selection_screen()
