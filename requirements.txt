@@ -5,10 +5,8 @@ seaborn
 scikit-learn
 lightgbm
 optuna
-shap
 streamlit
 lazypredict
 shap==0.47.1
 numba==0.61.0
 llvmlite==0.44.0
-
