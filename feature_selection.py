@@ -6,13 +6,12 @@ import lightgbm as lgb
 import matplotlib.pyplot as plt
 import streamlit as st
 
-from pathlib import Path
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import cross_val_score
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.decomposition import PCA
 
-# ========== Utils ==========
+# ========== Funções Auxiliares ==========
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -25,31 +24,28 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = 0
     return df
 
-
-def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
+def create_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def entropy(col):
         p_data = col.value_counts(normalize=True)
         return -np.sum(p_data * np.log2(p_data + 1e-9))
 
-    derived_df = pd.DataFrame(index=df.index)
-
     for col in df.select_dtypes(include=[np.number]).columns:
         if col == "Target":
             continue
-        try:
-            col_entropy = entropy(df[col])
-            for lag in range(1, 6):
-                ratio = df[col] / (df[col].shift(lag) + 1e-9)
-                ratio.fillna(0, inplace=True)
-                score_col = (ratio - ratio.mean()) / (ratio.std() + 1e-6)
-                derived_df[f"{col}_score_lag{lag}"] = score_col * col_entropy
-        except Exception as e:
-            st.warning(f"Erro ao criar score para '{col}': {e}")
-    
-    return derived_df
 
+        try:
+            for i in range(1, 6):
+                df[f"{col}_r{i}"] = df[col] / (df[col].shift(i) + 1e-6)
+            ratio_cols = [f"{col}_r{i}" for i in range(1, 6)]
+            df[f"{col}_entropy"] = entropy(df[col])
+            score = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
+            df[f"{col}_score"] = score * df[f"{col}_entropy"]
+        except Exception as e:
+            st.warning(f"Erro ao derivar '{col}': {e}")
+    
+    return df
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     def objective(trial):
@@ -73,7 +69,6 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
 
-
 def load_data() -> pd.DataFrame:
     st.subheader("📂 Upload dos Arquivos de Entrada")
 
@@ -94,8 +89,7 @@ def load_data() -> pd.DataFrame:
     df["Target"] = y.values.ravel()
     return df
 
-
-# ========== Main Feature Selection Pipeline ==========
+# ========== Pipeline Principal ==========
 
 def feature_selection_screen():
     df = load_data()
@@ -105,70 +99,60 @@ def feature_selection_screen():
         return
 
     df = encode_categoricals(df)
-    derived = create_score_features(df)
+    df = create_derived_features(df)
 
-    derived["Target"] = df["Target"]
+    st.subheader("🔍 Preview do Dataset")
+    st.dataframe(df.head())
 
-    # Amostragem estratificada com 100 registros
-    df_sampled = derived.copy()
-    try:
-        df_sampled, _ = train_test_split(derived, stratify=derived["Target"], test_size=(1 - 100 / len(derived)), random_state=42)
-    except:
-        st.warning("Amostragem estratificada falhou. Usando o conjunto completo.")
+    # Somente scores como entrada
+    score_cols = [col for col in df.columns if col.endswith("_score")]
+    df_score_only = df[score_cols + ["Target"]]
 
-    st.subheader("🔍 Preview do Dataset Amostrado")
-    st.dataframe(df_sampled.head())
+    # Amostragem estratificada de 100 amostras
+    df_sampled = df_score_only.groupby("Target", group_keys=False).apply(
+        lambda x: x.sample(min(len(x), 50), random_state=42)
+    )
 
-    X = df_sampled.drop(columns=["Target"])
-    y = df_sampled["Target"]
+    X_sampled = df_sampled.drop(columns=["Target"])
+    y_sampled = df_sampled["Target"]
 
-    # Remove colunas com apenas um valor (zero variância)
-    X = X.loc[:, X.nunique() > 1]
-
+    # Otimização e treino
     st.subheader("⚙️ Otimizando parâmetros do LightGBM com Optuna...")
     with st.spinner("Otimizando parâmetros..."):
-        best_params = optimize_lgbm(X, y, n_trials=30)
+        best_params = optimize_lgbm(X_sampled, y_sampled, n_trials=30)
 
     st.success("✅ Otimização concluída!")
     st.json(best_params)
 
     model = lgb.LGBMClassifier(**best_params)
-    model.fit(X, y)
+    model.fit(X_sampled, y_sampled)
 
+    # Seleção de variáveis
     st.subheader("📊 Seleção de Variáveis com LightGBM")
     selector = SelectFromModel(model, threshold="mean", prefit=True)
     selected_mask = selector.get_support()
-    selected_features = X.columns[selected_mask]
+    selected_features = X_sampled.columns[selected_mask]
     st.write("Variáveis selecionadas:", list(selected_features))
 
-    df_selected = X[selected_features].copy()
-    df_selected["Target"] = y.values
+    df_selected = X_sampled[selected_features].copy()
+    df_selected["Target"] = y_sampled.values
 
-    # PCA
-    try:
-        st.subheader("🧬 PCA - Redução de Dimensionalidade")
-        scaler = StandardScaler()
-        pca = PCA(n_components=2)
-        X_scaled = scaler.fit_transform(df_selected.drop(columns=["Target"]))
-        X_pca = pca.fit_transform(X_scaled)
-        pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
-        pca_df["Target"] = y.values
-        st.scatter_chart(pca_df, x="PC1", y="PC2", color="Target")
-    except Exception as e:
-        st.warning(f"Erro na PCA: {e}")
-
-    # SHAP Plot
+    # SHAP
     st.subheader("🌟 SHAP - Interpretação do Modelo")
     try:
         explainer = shap.Explainer(model, df_selected.drop(columns=["Target"]))
         shap_values = explainer(df_selected.drop(columns=["Target"]))
+
         st.set_option('deprecation.showPyplotGlobalUse', False)
         shap.summary_plot(shap_values, df_selected.drop(columns=["Target"]), plot_type="bar", show=False)
         st.pyplot()
     except Exception as e:
         st.warning(f"Erro ao gerar SHAP: {e}")
 
-    # Download dos resultados
+    # Download do CSV
     st.subheader("📥 Baixar resultado")
-    csv = df_selected.to_csv(index=False).encode('utf-8')
-    st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
+    try:
+        csv = df_selected.to_csv(index=False).encode('utf-8')
+        st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
+    except Exception as e:
+        st.error(f"Erro ao gerar arquivo CSV: {e}")
