@@ -1,14 +1,14 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
-import shap
 import optuna
+import lightgbm as lgb
 import matplotlib.pyplot as plt
+import streamlit as st
 
+from pathlib import Path
 from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
-from io import BytesIO
+from sklearn.feature_selection import SelectFromModel
 
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
@@ -17,33 +17,26 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
         try:
             df[col] = df[col].astype(str)
             df[col] = LabelEncoder().fit_transform(df[col])
-        except:
+        except Exception as e:
+            st.warning(f"Erro ao codificar '{col}': {e}")
             df[col] = 0
     return df
 
 
-def create_scores(df: pd.DataFrame) -> pd.DataFrame:
+def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    score_df = pd.DataFrame(index=df.index)
     for col in df.select_dtypes(include=[np.number]).columns:
         if col == "Target":
             continue
         try:
-            series = df[col].replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
-            if (series > 0).all():
-                ratios = pd.concat(
-                    [(series / series.shift(i)).rename(f"{col}_ratio_{i}") for i in range(1, 6)],
-                    axis=1
-                )
-                score_df[f"{col}_entropy"] = -series.value_counts(normalize=True).mul(
-                    np.log2(series.value_counts(normalize=True) + 1e-9)
-                ).sum()
-                score_df[f"{col}_score"] = (series - series.mean()) / (series.std() + 1e-6)
-        except:
-            continue
-    score_df = score_df.filter(like="_score", axis=1)
-    score_df = score_df.replace(0, np.nan).dropna(axis=1)
-    return score_df
+            mean = df[col].mean()
+            std = df[col].std() + 1e-6
+            score = (df[col] - mean) / std
+            score = np.abs(score)  # garantir valores positivos
+            df[f"{col}_score"] = score
+        except Exception as e:
+            st.warning(f"Erro ao calcular score de '{col}': {e}")
+    return df
 
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
@@ -53,16 +46,17 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
             "metric": "auc",
             "verbosity": -1,
             "boosting_type": "gbdt",
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 20, 60),
-            "max_depth": trial.suggest_int("max_depth", 3, 7),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 80),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 100),
             "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
             "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
             "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
         }
         model = lgb.LGBMClassifier(**params)
-        return cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
+        score = cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
+        return score
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
@@ -70,8 +64,11 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
 
 
 def load_data() -> pd.DataFrame:
-    x_file = st.file_uploader("📂 Upload X.csv (variáveis)", type=["csv"])
-    y_file = st.file_uploader("📂 Upload y.csv (target)", type=["csv"])
+    st.subheader("📂 Upload dos Arquivos de Entrada")
+
+    x_file = st.file_uploader("Selecione o arquivo de variáveis (X.csv)", type=["csv"])
+    y_file = st.file_uploader("Selecione o arquivo de target (y.csv)", type=["csv"])
+
     if not x_file or not y_file:
         st.stop()
 
@@ -79,74 +76,69 @@ def load_data() -> pd.DataFrame:
     y = pd.read_csv(y_file, index_col=0)
 
     if X.shape[0] != y.shape[0]:
-        st.error("X e y têm tamanhos diferentes.")
+        st.error("Os arquivos X e y têm números de linhas diferentes!")
         st.stop()
 
     df = X.copy()
     df["Target"] = y.values.ravel()
-    df = encode_categoricals(df)
     return df
 
 
 def feature_selection_screen():
     df = load_data()
-    df_scores = create_scores(df)
-    df_scores["Target"] = df["Target"].values
+    if df.empty:
+        st.warning("O dataset está vazio ou não foi carregado corretamente.")
+        return
 
-    # 🔍 Preview
+    df = encode_categoricals(df)
+    df = create_score_features(df)
+
+    # Apenas os scores e target
+    score_cols = [col for col in df.columns if col.endswith("_score")]
+    score_df = df[score_cols + ["Target"]].copy()
+
+    # Remove colunas com valor zero ou NaN
+    score_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    score_df.interpolate(axis=0, inplace=True)
+    score_df.dropna(axis=1, inplace=True)
+    score_df = score_df.loc[:, (score_df != 0).any(axis=0)]
+
+    # Amostragem estratificada
+    strat_sample = score_df.groupby("Target", group_keys=False).apply(lambda x: x.sample(min(len(x), 25), random_state=42))
+    X_sampled = strat_sample.drop(columns=["Target"])
+    y_sampled = strat_sample["Target"]
+
     st.subheader("🔍 Dataset de Entrada (Scores)")
-    st.dataframe(df_scores.drop(columns="Target").head())
+    st.dataframe(X_sampled.head())
 
-    # Stratified Sampling (pré-configurado: 100 amostras)
-    df_sampled, _ = train_test_split(
-        df_scores, stratify=df_scores["Target"], train_size=100, random_state=42
-    )
+    with st.spinner("⚙️ Otimizando e treinando modelo..."):
+        best_params = optimize_lgbm(X_sampled, y_sampled, n_trials=30)
 
-    X = df_sampled.drop(columns=["Target"])
-    y = df_sampled["Target"]
-
-    # ⏱ Otimização com Optuna
-    st.subheader("⚙️ Otimizando LightGBM com Optuna...")
-    with st.spinner("Executando otimização..."):
-        best_params = optimize_lgbm(X, y, n_trials=30)
-    st.success("✅ Parâmetros Otimizados:")
+    st.success("✅ Otimização concluída!")
     st.json(best_params)
 
-    # 🔎 Seleção de Variáveis com LightGBM
     model = lgb.LGBMClassifier(**best_params)
-    model.fit(X, y)
+    model.fit(X_sampled, y_sampled)
 
-    importances = pd.Series(model.feature_importances_, index=X.columns)
-    top_features = importances.sort_values(ascending=False).head(50).index.tolist()
-    X_selected = X[top_features]
+    # Seleciona top 50 variáveis com maior importância
+    feature_importance = pd.Series(model.feature_importances_, index=X_sampled.columns)
+    top_50_features = feature_importance.nlargest(50).index.tolist()
 
-    st.subheader("📈 Quantidade de Variáveis Selecionadas")
-    st.metric("Variáveis Selecionadas", len(top_features))
+    df_selected = X_sampled[top_50_features].copy()
 
-    # 📊 SHAP Summary Plot
-    st.subheader("🌟 SHAP - Interpretação do Modelo")
-    try:
-        explainer = shap.Explainer(model, X_selected)
-        shap_values = explainer(X_selected)
-        st.set_option('deprecation.showPyplotGlobalUse', False)
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, X_selected, plot_type="bar", show=False)
-        st.pyplot()
-    except Exception as e:
-        st.warning(f"Erro ao gerar gráfico SHAP: {e}")
+    st.subheader("📌 Variáveis Selecionadas")
+    st.write(f"Total de variáveis selecionadas: **{len(top_50_features)}**")
+    st.dataframe(df_selected.head())
 
-    # 📁 Download do Resultado
+    # Gráfico de importância (histograma)
+    st.subheader("📊 Importância Relativa das Variáveis Selecionadas")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    feature_importance[top_50_features].sort_values().plot(kind="barh", ax=ax)
+    ax.set_title("Importância das Variáveis Selecionadas (LightGBM)")
+    st.pyplot(fig)
+
+    # CSV para download
     st.subheader("📥 Baixar Variáveis Selecionadas")
-    selected_df = pd.DataFrame(top_features, columns=["Variável"])
-    csv_bytes = selected_df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Baixar CSV", csv_bytes, file_name="top_50_variaveis.csv")
-
-    # Critério de Seleção
-    with st.expander("🧠 Critério de Seleção das Variáveis"):
-        st.markdown(
-            """
-            As variáveis foram selecionadas com base na **importância média** atribuída pelo modelo LightGBM,
-            após otimização de hiperparâmetros com **Optuna**. Foram escolhidas as **50 features com maior capacidade de discriminação**
-            do comportamento-alvo (`Target`).
-            """
-        )
+    csv = pd.DataFrame(top_50_features, columns=["selected_features"])
+    st.download_button("📄 Baixar Lista de Variáveis (CSV)", data=csv.to_csv(index=False).encode("utf-8"),
+                       file_name="top_50_selected_features.csv")
