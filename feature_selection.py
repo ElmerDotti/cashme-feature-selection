@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from sklearn.model_selection import StratifiedShuffleSplit, cross_val_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.feature_selection import SelectFromModel
 from sklearn.metrics import roc_auc_score
+import gc
 
 # ========== Utilitários ==========
 
@@ -25,9 +25,11 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = 0
     return df
 
+
 def entropy(col):
     p_data = col.value_counts(normalize=True)
     return -np.sum(p_data * np.log2(p_data + 1e-9))
+
 
 def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -48,11 +50,26 @@ def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return score_features
 
+
+def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Remove colunas com baixa variância
+    df = df.loc[:, df.nunique() > 1]
+    # Remove colunas com mais de 50% de valores nulos
+    threshold = 0.5 * df.shape[0]
+    df = df.dropna(axis=1, thresh=threshold)
+    # Interpola e preenche valores faltantes
+    df = df.interpolate(method='linear', limit_direction='both', axis=0)
+    df = df.fillna(0)
+    return df
+
+
 def stratified_sample(df: pd.DataFrame, target_col: str = "Target", sample_size: int = 50) -> pd.DataFrame:
     splitter = StratifiedShuffleSplit(n_splits=1, test_size=sample_size, random_state=42)
     for _, test_idx in splitter.split(df, df[target_col]):
         return df.iloc[test_idx].reset_index(drop=True)
     return df
+
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     def objective(trial):
@@ -75,6 +92,7 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
+
 
 def load_data() -> pd.DataFrame:
     st.subheader("📂 Upload dos Arquivos de Entrada")
@@ -106,6 +124,7 @@ def feature_selection_screen():
         return
 
     df = encode_categoricals(df)
+    df = clean_dataset(df)
 
     # Engenharia de Atributos
     df_scores = create_score_features(df)
@@ -127,28 +146,28 @@ def feature_selection_screen():
     st.success("✅ Otimização concluída!")
     st.json(best_params)
 
-    # Modelo final com parâmetros otimizados
+    # Modelo final
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X, y)
 
-    # Seleção de Variáveis com Modelo Otimizado
-    st.subheader("📊 Seleção de Variáveis com LightGBM")
-    selector = SelectFromModel(model, threshold="mean", prefit=True)
-    selected_features = X.columns[selector.get_support()]
-    st.write(f"✅ {len(selected_features)} variáveis selecionadas:")
-    st.code(list(selected_features))
+    # Seleção das 50 melhores variáveis por importância
+    st.subheader("📊 Top 50 Variáveis Selecionadas")
+    importances = pd.Series(model.feature_importances_, index=X.columns)
+    top_features = importances.sort_values(ascending=False).head(50).index.tolist()
+    st.write(f"Selecionadas {len(top_features)} variáveis")
+    st.code(top_features)
 
-    df_selected = X[selected_features].copy()
+    df_selected = X[top_features].copy()
     df_selected["Target"] = y.values
 
-    # SHAP Value
+    # SHAP Plot
     st.subheader("🌟 SHAP - Interpretação do Modelo")
     try:
-        explainer = shap.Explainer(model, X[selected_features])
-        shap_values = explainer(X[selected_features])
+        explainer = shap.Explainer(model, X[top_features])
+        shap_values = explainer(X[top_features])
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        shap.summary_plot(shap_values, X[selected_features], plot_type="bar", show=False)
+        shap.summary_plot(shap_values, X[top_features], plot_type="bar", show=False)
         st.pyplot(fig)
     except Exception as e:
         st.warning(f"Erro ao gerar gráfico SHAP: {e}")
@@ -164,7 +183,6 @@ def feature_selection_screen():
         mime="text/csv"
     )
 
-    # Libera memória
+    # Gerenciamento de memória
     del df, df_scores, df_sampled, X, y, model, shap_values, explainer
-    import gc
     gc.collect()
