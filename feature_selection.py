@@ -1,35 +1,53 @@
 import pandas as pd
+import numpy as np
 import shap
 import optuna
 import lightgbm as lgb
 import matplotlib.pyplot as plt
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.feature_selection import SelectFromModel
-from sklearn.preprocessing import LabelEncoder
+import seaborn as sns
 from pathlib import Path
+from sklearn.decomposition import PCA
+from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
+from sklearn.feature_selection import SelectFromModel
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.cluster import KMeans
+import streamlit as st
+import base64
+import io
 
 
-def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Codifica variáveis categóricas usando LabelEncoder.
-    Conversão segura: transforma em string e trata falhas silenciosamente.
-    """
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in df.select_dtypes(include=["object", "category"]).columns:
-        try:
-            df[col] = df[col].astype(str)  # Garante string
-            df[col] = LabelEncoder().fit_transform(df[col])
-        except Exception as e:
-            print(f"Erro ao codificar '{col}': {e}")
-            df[col] = 0  # fallback para evitar falha
+    df.dropna(axis=1, thresh=len(df) * 0.5, inplace=True)  # Remove colunas com mais de 50% nulos
+    df.fillna(-999, inplace=True)  # Fallback para demais nulos
     return df
 
 
-def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
-    """
-    Usa Optuna para buscar os melhores hiperparâmetros para o LightGBM.
-    """
+def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.select_dtypes(include=["object", "category"]).columns:
+        try:
+            df[col] = df[col].astype(str)
+            df[col] = LabelEncoder().fit_transform(df[col])
+        except Exception as e:
+            st.warning(f"Erro ao codificar {col}: {e}")
+            df[col] = 0
+    return df
 
+
+def show_eda_visuals(df: pd.DataFrame):
+    st.subheader("🔍 Matriz de Correlação")
+    corr = df.corr(numeric_only=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.heatmap(corr, cmap="coolwarm", annot=False, ax=ax)
+    st.pyplot(fig)
+
+    st.subheader("📉 Distribuição da Variável Target")
+    if "Target" in df.columns:
+        st.bar_chart(df["Target"].value_counts())
+
+
+def optimize_lgbm(X, y, n_trials=25):
     def objective(trial):
         params = {
             "objective": "binary",
@@ -37,99 +55,86 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
             "verbosity": -1,
             "boosting_type": "gbdt",
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+            "num_leaves": trial.suggest_int("num_leaves", 31, 150),
             "max_depth": trial.suggest_int("max_depth", 3, 12),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 100),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 100),
             "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
             "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-            "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
         }
-
         model = lgb.LGBMClassifier(**params)
-        score = cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
-        return score
+        return cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
 
 
-def select_features_with_lgbm(df: pd.DataFrame, output_dir: str = "outputs") -> tuple[pd.DataFrame, list[str]]:
-    """
-    Realiza a seleção de features:
-    - Codifica categóricas
-    - Otimiza e treina LightGBM
-    - Seleciona features importantes
-    - Gera gráfico de SHAP
-    """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    df = encode_categoricals(df)
-    X = df.drop(columns=["Target"])
-    y = df["Target"]
-
-    # Otimização de hiperparâmetros
-    best_params = optimize_lgbm(X, y, n_trials=30)
-    model = lgb.LGBMClassifier(**best_params)
-    model.fit(X, y)
-
-    # Seleção com base na importância média
-    selector = SelectFromModel(model, threshold="mean", prefit=True)
-    selected_mask = selector.get_support()
-    selected_features = X.columns[selected_mask]
-    df_selected = X[selected_features].copy()
-    df_selected["Target"] = y.values
-
-    # SHAP Values
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X)
-
-    plt.figure(figsize=(12, 8))
-    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/shap_values.png")
-    plt.close()
-
-    # Salva o novo dataset com features selecionadas
-    df_selected.to_csv(f"{output_dir}/selected_features.csv", index=False)
-
-    return df_selected, selected_features.tolist()
-
-import streamlit as st
-import base64
-import io
-
 def feature_selection_screen():
-    st.title("📊 Seleção de Variáveis com LightGBM + Optuna")
+    st.title("📊 Seleção de Variáveis com ML + Otimização")
 
-    uploaded_file = st.file_uploader("📁 Faça upload de um arquivo CSV com a coluna 'Target'", type="csv")
+    uploaded_file = st.file_uploader("📁 Faça upload do CSV contendo a coluna 'Target'")
     if uploaded_file is None:
-        st.info("Por favor, envie um arquivo para continuar.")
+        st.info("Envie um arquivo CSV para continuar.")
         return
 
     df = pd.read_csv(uploaded_file)
     if "Target" not in df.columns:
-        st.error("O arquivo precisa conter uma coluna chamada 'Target'.")
+        st.error("Coluna 'Target' obrigatória no dataset.")
         return
 
-    st.success("Arquivo carregado com sucesso! Iniciando seleção de features...")
+    show_eda_visuals(df)
 
-    with st.spinner("Executando seleção... isso pode levar um tempo..."):
-        selected_df, selected_cols = select_features_with_lgbm(df)
+    st.markdown("---")
+    st.subheader("🔧 Pré-processamento e Codificação")
 
-    st.subheader("✅ Features Selecionadas:")
-    st.write(selected_cols)
+    df_clean = preprocess_data(df)
+    df_encoded = encode_categoricals(df_clean)
 
-    st.subheader("📈 Gráfico de Importância SHAP:")
-    shap_path = Path("outputs/shap_values.png")
-    if shap_path.exists():
-        st.image(str(shap_path))
-    else:
-        st.warning("Gráfico SHAP não encontrado.")
+    X = df_encoded.drop("Target", axis=1)
+    y = df_encoded["Target"]
 
-    st.subheader("📥 Download dos Dados com Features Selecionadas:")
-    csv = selected_df.to_csv(index=False)
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
+
+    st.info(f"{X_train.shape[1]} variáveis consideradas para otimização...")
+
+    with st.spinner("🧠 Otimizando hiperparâmetros..."):
+        best_params = optimize_lgbm(X_train, y_train)
+
+    model = lgb.LGBMClassifier(**best_params)
+    model.fit(X_train, y_train)
+
+    selector = SelectFromModel(model, threshold="mean", prefit=True)
+    selected_features = X.columns[selector.get_support()]
+    df_selected = df_encoded[selected_features].copy()
+    df_selected["Target"] = y.values
+
+    st.success(f"{len(selected_features)} variáveis selecionadas!")
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+
+    st.subheader("📊 SHAP - Importância das Variáveis")
+    fig = plt.figure(figsize=(12, 8))
+    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+    st.pyplot(fig)
+
+    st.subheader("📉 PCA - Redução de Dimensionalidade")
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(StandardScaler().fit_transform(X))
+    fig2, ax2 = plt.subplots()
+    ax2.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='viridis')
+    ax2.set_title("PCA - 2 Componentes")
+    st.pyplot(fig2)
+
+    st.subheader("🧬 Segmentação via K-Means")
+    clusters = KMeans(n_clusters=2, random_state=42).fit_predict(X)
+    fig3, ax3 = plt.subplots()
+    ax3.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, cmap='cool')
+    ax3.set_title("KMeans Clustering em 2D PCA")
+    st.pyplot(fig3)
+
+    csv = df_selected.to_csv(index=False)
     b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="selected_features.csv">Clique para baixar</a>'
+    href = f'<a href="data:file/csv;base64,{b64}" download="selected_features.csv">📥 Baixar CSV com Features Selecionadas</a>'
     st.markdown(href, unsafe_allow_html=True)
-
