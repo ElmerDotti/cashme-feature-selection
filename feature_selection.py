@@ -3,14 +3,13 @@ import numpy as np
 import shap
 import optuna
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import streamlit as st
-import gc
+import matplotlib.pyplot as plt
 
 from io import BytesIO
 from sklearn.model_selection import StratifiedShuffleSplit, cross_val_score
-from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.feature_selection import SelectFromModel
 from sklearn.decomposition import PCA
 
 # ========== Utilitários ==========
@@ -26,38 +25,34 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = 0
     return df
 
+def entropy(col):
+    p_data = col.value_counts(normalize=True)
+    return -np.sum(p_data * np.log2(p_data + 1e-9))
 
 def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    def entropy(col):
-        p_data = col.value_counts() / len(col)
-        return -sum(p_data * np.log2(p_data + 1e-9))
-
-    score_df = pd.DataFrame(index=df.index)
+    score_features = pd.DataFrame(index=df.index)
 
     for col in df.select_dtypes(include=[np.number]).columns:
         if col == "Target":
             continue
         try:
-            ratios = []
-            for i in range(1, 6):
-                ratio = df[col] / (df[col].shift(i).replace(0, np.nan))
-                ratio.replace([np.inf, -np.inf], np.nan, inplace=True)
-                ratio.fillna(1, inplace=True)
-                ratios.append(ratio)
-
-            ent = entropy(df[col])
-            mean = df[col].mean()
-            std = df[col].std() + 1e-6
-
-            score = (df[col] - mean) / std + ent + sum(ratios)
-            score_df[f"{col}_score"] = score
+            ratios = [df[col] / df[col].shift(i) for i in range(1, 6)]
+            ratio_mean = pd.concat(ratios, axis=1).mean(axis=1).fillna(0)
+            col_entropy = entropy(df[col])
+            col_score = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
+            score_features[f"{col}_score"] = col_score * col_entropy * ratio_mean
         except Exception as e:
-            st.warning(f"Erro ao criar score de '{col}': {e}")
+            st.warning(f"Erro ao criar score para '{col}': {e}")
+            score_features[f"{col}_score"] = 0
 
-    return score_df
+    return score_features
 
+def stratified_sample(df: pd.DataFrame, target_col: str = "Target", sample_size: int = 50) -> pd.DataFrame:
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=sample_size, random_state=42)
+    for _, test_idx in splitter.split(df, df[target_col]):
+        return df.iloc[test_idx].reset_index(drop=True)
+    return df
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     def objective(trial):
@@ -81,7 +76,6 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
 
-
 def load_data() -> pd.DataFrame:
     st.subheader("📂 Upload dos Arquivos de Entrada")
 
@@ -102,7 +96,6 @@ def load_data() -> pd.DataFrame:
     df["Target"] = y.values.ravel()
     return df
 
-
 # ========== Pipeline principal ==========
 
 def feature_selection_screen():
@@ -114,58 +107,64 @@ def feature_selection_screen():
 
     df = encode_categoricals(df)
 
-    # Amostragem estratificada de 50 amostras
-    st.subheader("🔎 Amostragem Estratificada")
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=50, random_state=42)
-    for train_idx, _ in splitter.split(df.drop(columns=["Target"]), df["Target"]):
-        df = df.iloc[train_idx]
-    st.write(f"Amostra com {df.shape[0]} registros.")
+    # Engenharia de features + Score
+    df_scores = create_score_features(df)
+    df_scores["Target"] = df["Target"].values
 
-    score_df = create_score_features(df)
-    score_df["Target"] = df["Target"].values
-    st.subheader("🔍 Preview do Dataset (Scores)")
-    st.dataframe(score_df.head())
+    # Amostragem Estratificada
+    df_sampled = stratified_sample(df_scores, target_col="Target", sample_size=50)
 
-    X = score_df.drop(columns=["Target"])
-    y = score_df["Target"]
+    st.subheader("🔍 Amostra dos Scores Calculados")
+    st.dataframe(df_sampled.head(10))
 
-    # Remove colunas com variância nula
-    X = X.loc[:, X.nunique() > 1]
+    X = df_sampled.drop(columns=["Target"])
+    y = df_sampled["Target"]
 
-    st.subheader("⚙️ Otimizando parâmetros do LightGBM com Optuna...")
-    with st.spinner("Otimizando parâmetros..."):
-        best_params = optimize_lgbm(X, y, n_trials=30)
+    # Otimização LightGBM
+    st.subheader("⚙️ Otimizando modelo com Optuna...")
+    with st.spinner("Otimizando..."):
+        best_params = optimize_lgbm(X, y, n_trials=20)
     st.success("✅ Otimização concluída!")
     st.json(best_params)
 
+    # Treinamento
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X, y)
 
-    st.subheader("📊 Seleção de Variáveis com LightGBM")
+    # Seleção de Variáveis
+    st.subheader("📊 Variáveis Selecionadas com LightGBM")
     selector = SelectFromModel(model, threshold="mean", prefit=True)
-    selected_mask = selector.get_support()
-    selected_features = X.columns[selected_mask]
-    st.write("Variáveis selecionadas:", list(selected_features))
+    selected_features = X.columns[selector.get_support()]
+    st.write("Variáveis Selecionadas:", list(selected_features))
 
-    df_selected = X[selected_features].copy()
+    df_selected = df_sampled[selected_features].copy()
     df_selected["Target"] = y.values
 
     # SHAP Plot
     st.subheader("🌟 SHAP - Interpretação do Modelo")
     try:
-        explainer = shap.Explainer(model, df_selected.drop(columns=["Target"]))
-        shap_values = explainer(df_selected.drop(columns=["Target"]))
+        explainer = shap.Explainer(model, df_selected[selected_features])
+        shap_values = explainer(df_selected[selected_features])
+
         st.set_option('deprecation.showPyplotGlobalUse', False)
-        shap.summary_plot(shap_values, df_selected.drop(columns=["Target"]), plot_type="bar", show=False)
-        st.pyplot()
+        fig, ax = plt.subplots(figsize=(10, 6))
+        shap.summary_plot(shap_values, df_selected[selected_features], plot_type="bar", show=False)
+        st.pyplot(fig)
     except Exception as e:
-        st.warning(f"Erro ao gerar SHAP: {e}")
+        st.warning(f"Erro ao gerar gráfico SHAP: {e}")
 
-    # Download dos resultados
-    st.subheader("📥 Baixar resultado")
-    csv = df_selected.to_csv(index=False).encode('utf-8')
-    st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
+    # Download CSV
+    st.subheader("📥 Baixar Resultado")
+    csv_buffer = BytesIO()
+    df_selected.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="📄 Baixar CSV das Variáveis Selecionadas",
+        data=csv_buffer.getvalue(),
+        file_name="selected_features.csv",
+        mime="text/csv"
+    )
 
-    # Liberar memória
-    del df, score_df, X, y, model, df_selected
+    # Libera memória
+    del df, df_scores, df_sampled, X, y, model, shap_values, explainer
+    import gc
     gc.collect()
