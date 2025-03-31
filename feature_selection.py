@@ -7,13 +7,12 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from pathlib import Path
-from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.model_selection import cross_val_score
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.decomposition import PCA
-from sklearn.metrics import roc_auc_score
 
-# ========= Funções utilitárias =========
+# ========== Utils ==========
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -30,17 +29,20 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 def create_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Entropia
     def entropy(col):
         p_data = col.value_counts() / len(col)
         return -sum(p_data * np.log2(p_data + 1e-9))
 
     for col in df.select_dtypes(include=[np.number]).columns:
-        df[f"{col}_lag1"] = df[col].shift(1).fillna(0)
-        df[f"{col}_diff"] = df[col] - df[f"{col}_lag1"]
-        df[f"{col}_score"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
-        df[f"{col}_entropy"] = entropy(df[col])
-
+        if col == "Target":
+            continue
+        try:
+            df[f"{col}_lag1"] = df[col].shift(1).fillna(0)
+            df[f"{col}_diff"] = df[col] - df[f"{col}_lag1"]
+            df[f"{col}_score"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
+            df[f"{col}_entropy"] = entropy(df[col])
+        except Exception as e:
+            st.warning(f"Erro ao criar features derivadas de '{col}': {e}")
     return df
 
 
@@ -79,11 +81,16 @@ def load_data() -> pd.DataFrame:
     X = pd.read_csv(x_file, index_col=0)
     y = pd.read_csv(y_file, index_col=0)
 
+    if X.shape[0] != y.shape[0]:
+        st.error("Os arquivos X e y têm números de linhas diferentes!")
+        st.stop()
+
     df = X.copy()
     df["Target"] = y.values.ravel()
-
     return df
 
+
+# ========== Main Feature Selection Pipeline ==========
 
 def feature_selection_screen():
     df = load_data()
@@ -100,6 +107,9 @@ def feature_selection_screen():
 
     X = df.drop(columns=["Target"])
     y = df["Target"]
+
+    # Remove colunas com apenas um valor (zero variância)
+    X = X.loc[:, X.nunique() > 1]
 
     st.subheader("⚙️ Otimizando parâmetros do LightGBM com Optuna...")
     with st.spinner("Otimizando parâmetros..."):
@@ -125,10 +135,10 @@ def feature_selection_screen():
         st.subheader("🧬 PCA - Redução de Dimensionalidade")
         scaler = StandardScaler()
         pca = PCA(n_components=2)
-        X_pca = pca.fit_transform(scaler.fit_transform(df_selected.drop(columns=["Target"])))
+        X_scaled = scaler.fit_transform(df_selected.drop(columns=["Target"]))
+        X_pca = pca.fit_transform(X_scaled)
         pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
         pca_df["Target"] = y.values
-
         st.scatter_chart(pca_df, x="PC1", y="PC2", color="Target")
     except Exception as e:
         st.warning(f"Erro na PCA: {e}")
@@ -136,10 +146,10 @@ def feature_selection_screen():
     # SHAP Plot
     st.subheader("🌟 SHAP - Interpretação do Modelo")
     try:
-        explainer = shap.Explainer(model, X[selected_features])
-        shap_values = explainer(X[selected_features])
+        explainer = shap.Explainer(model, df_selected.drop(columns=["Target"]))
+        shap_values = explainer(df_selected.drop(columns=["Target"]))
         st.set_option('deprecation.showPyplotGlobalUse', False)
-        shap.summary_plot(shap_values, X[selected_features], plot_type="bar", show=False)
+        shap.summary_plot(shap_values, df_selected.drop(columns=["Target"]), plot_type="bar", show=False)
         st.pyplot()
     except Exception as e:
         st.warning(f"Erro ao gerar SHAP: {e}")
@@ -148,4 +158,3 @@ def feature_selection_screen():
     st.subheader("📥 Baixar resultado")
     csv = df_selected.to_csv(index=False).encode('utf-8')
     st.download_button("📄 Baixar CSV com Features Selecionadas", data=csv, file_name="selected_features.csv")
-
