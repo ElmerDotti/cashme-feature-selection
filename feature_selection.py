@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 import shap
 import optuna
 import lightgbm as lgb
@@ -11,28 +10,38 @@ from pathlib import Path
 
 
 def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    """Codifica colunas categóricas como números para uso em modelos."""
+    """
+    Codifica variáveis categóricas usando LabelEncoder.
+    Conversão segura: transforma em string e trata falhas silenciosamente.
+    """
     df = df.copy()
     for col in df.select_dtypes(include=["object", "category"]).columns:
-        df[col] = LabelEncoder().fit_transform(df[col])
+        try:
+            df[col] = df[col].astype(str)  # Garante string
+            df[col] = LabelEncoder().fit_transform(df[col])
+        except Exception as e:
+            print(f"Erro ao codificar '{col}': {e}")
+            df[col] = 0  # fallback para evitar falha
     return df
 
 
 def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
-    """Otimiza os hiperparâmetros de um modelo LightGBM usando Optuna."""
-    
+    """
+    Usa Optuna para buscar os melhores hiperparâmetros para o LightGBM.
+    """
+
     def objective(trial):
         params = {
             "objective": "binary",
             "metric": "auc",
             "verbosity": -1,
             "boosting_type": "gbdt",
-            "learning_rate": trial.suggest_loguniform("learning_rate", 0.01, 0.2),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
             "num_leaves": trial.suggest_int("num_leaves", 20, 150),
             "max_depth": trial.suggest_int("max_depth", 3, 12),
             "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 100),
-            "feature_fraction": trial.suggest_uniform("feature_fraction", 0.5, 1.0),
-            "bagging_fraction": trial.suggest_uniform("bagging_fraction", 0.5, 1.0),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
             "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
         }
 
@@ -45,28 +54,33 @@ def optimize_lgbm(X: pd.DataFrame, y: pd.Series, n_trials: int = 20):
     return study.best_params
 
 
-def select_features_with_lgbm(df: pd.DataFrame, output_dir: str = "outputs") -> pd.DataFrame:
-    """Seleciona variáveis com LightGBM otimizado e gera SHAP values."""
-
+def select_features_with_lgbm(df: pd.DataFrame, output_dir: str = "outputs") -> tuple[pd.DataFrame, list[str]]:
+    """
+    Realiza a seleção de features:
+    - Codifica categóricas
+    - Otimiza e treina LightGBM
+    - Seleciona features importantes
+    - Gera gráfico de SHAP
+    """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     df = encode_categoricals(df)
     X = df.drop(columns=["Target"])
     y = df["Target"]
 
-    # Otimização dos parâmetros
+    # Otimização de hiperparâmetros
     best_params = optimize_lgbm(X, y, n_trials=30)
     model = lgb.LGBMClassifier(**best_params)
     model.fit(X, y)
 
-    # Seleção de variáveis
+    # Seleção com base na importância média
     selector = SelectFromModel(model, threshold="mean", prefit=True)
     selected_mask = selector.get_support()
     selected_features = X.columns[selected_mask]
     df_selected = X[selected_features].copy()
     df_selected["Target"] = y.values
 
-    # SHAP values
+    # SHAP Values
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
@@ -76,6 +90,7 @@ def select_features_with_lgbm(df: pd.DataFrame, output_dir: str = "outputs") -> 
     plt.savefig(f"{output_dir}/shap_values.png")
     plt.close()
 
-    # Exportação
-    df_selected.to_csv(f"{output_dir}/selected_features.csv")
+    # Salva o novo dataset com features selecionadas
+    df_selected.to_csv(f"{output_dir}/selected_features.csv", index=False)
+
     return df_selected, selected_features.tolist()
