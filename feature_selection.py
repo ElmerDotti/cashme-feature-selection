@@ -1,38 +1,50 @@
-import streamlit as st
+
 import pandas as pd
 import numpy as np
-import optuna
+import streamlit as st
 import lightgbm as lgb
+import optuna
 import matplotlib.pyplot as plt
-
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.neural_network import MLPClassifier
-from lightgbm import LGBMClassifier
+from sklearn.exceptions import ConvergenceWarning
+import warnings
 
-# =============================
-# Utilitários
-# =============================
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
-@st.cache_data
-def load_large_csv(file, nrows=5000):
-    return pd.read_csv(file, nrows=nrows, dtype='float32', low_memory=False)
+def normalize_scores(df_scores):
+    df_scores = df_scores.abs()
+    return (df_scores - df_scores.min()) / (df_scores.max() - df_scores.min() + 1e-6)
 
-def create_score_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for col in df.columns:
-        if col == "Target":
-            continue
-        std = df[col].std()
-        mean = df[col].mean()
-        if std > 0:
-            score = (df[col] - mean) / std
-        else:
-            score = df[col] - mean
-        df[f"{col}_score"] = np.abs(score.fillna(0))
-    return df[[c for c in df.columns if c.endswith("_score")] + ["Target"]]
+def load_data():
+    st.subheader("📂 Upload dos Arquivos de Entrada")
+    x_file = st.file_uploader("Selecione o arquivo de variáveis (X.csv)", type=["csv"])
+    y_file = st.file_uploader("Selecione o arquivo de target (y.csv)", type=["csv"])
+    if not x_file or not y_file:
+        st.stop()
+    X = pd.read_csv(x_file, index_col=0)
+    y = pd.read_csv(y_file, index_col=0).values.ravel()
+    return X, y
 
-def optimize_lgbm(X, y, n_trials=30):
+def feature_selection_screen():
+    X, y = load_data()
+
+    # Normalizar e remover colunas nulas ou zero
+    X = X.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
+    X = X.loc[:, (X != 0).any(axis=0)]
+    X_scores = normalize_scores(X.add_suffix("_score"))
+
+    # Amostragem estratificada com 100 registros
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=100, random_state=42)
+    for train_idx, _ in splitter.split(X_scores, y):
+        X_sampled = X_scores.iloc[train_idx]
+        y_sampled = y[train_idx]
+
+    st.subheader("🔍 Dataset de Entrada (Scores)")
+    st.dataframe(X_sampled.head())
+
+    # LightGBM + Optuna
     def objective(trial):
         params = {
             "objective": "binary",
@@ -48,69 +60,35 @@ def optimize_lgbm(X, y, n_trials=30):
             "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
         }
         model = lgb.LGBMClassifier(**params)
-        return cross_val_score(model, X, y, cv=3, scoring="roc_auc").mean()
+        return model.fit(X_sampled, y_sampled).score(X_sampled, y_sampled)
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials)
-    return study.best_params
+    st.subheader("⚙️ Otimizando LightGBM com Optuna...")
+    with st.spinner("Otimizando parâmetros..."):
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=30)
 
-# =============================
-# Pipeline Principal
-# =============================
+    best_params = study.best_params
+    model = lgb.LGBMClassifier(**best_params)
+    model.fit(X_sampled, y_sampled)
+    importances = pd.Series(model.feature_importances_, index=X_sampled.columns)
+    top_features = importances.sort_values(ascending=False).head(150)
 
-def feature_selection_screen():
-    st.subheader("📂 Upload dos Arquivos de Entrada")
-    x_file = st.file_uploader("🔢 Variáveis (X.csv)", type=["csv"])
-    y_file = st.file_uploader("🎯 Target (y.csv)", type=["csv"])
+    # Rede Neural
+    clf = MLPClassifier(hidden_layer_sizes=(50,), max_iter=300, random_state=42)
+    clf.fit(X_sampled[top_features.index], y_sampled)
+    nn_weights = pd.Series(np.abs(clf.coefs_[0]).sum(axis=1), index=top_features.index)
 
-    if not x_file or not y_file:
-        st.stop()
+    # Seleção final
+    top_100_features = nn_weights.sort_values(ascending=False).head(100)
 
-    with st.spinner("📥 Carregando arquivos..."):
-        X = load_large_csv(x_file, nrows=5000)
-        y = pd.read_csv(y_file, index_col=0)
+    st.subheader("✅ Variáveis Selecionadas (Top 100)")
+    st.write(list(top_100_features.index))
+    st.download_button("📥 Baixar Lista de Variáveis", data="\n".join(top_100_features.index), file_name="variaveis_selecionadas.txt")
 
-    y = y.iloc[:len(X)]  # garante alinhamento
-    df = X.copy()
-    df["Target"] = y.values.ravel()
-
-    # Limpeza de dados
-    df.dropna(axis=1, inplace=True)  # remove colunas com NaN
-    df = df.loc[:, df.nunique() > 1]  # remove colunas constantes
-
-    # Criação de scores
-    df_scores = create_score_features(df)
-
-    # Amostragem estratificada
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=100, random_state=42)
-    for sample_idx, _ in splitter.split(df_scores, df_scores["Target"]):
-        df_sample = df_scores.iloc[sample_idx]
-
-    X_sample = df_sample.drop(columns=["Target"])
-    y_sample = df_sample["Target"]
-
-    st.success("✅ Dados processados com sucesso!")
-
-    # Otimização LGBM
-    st.subheader("🚀 Otimizando LightGBM com Optuna...")
-    with st.spinner("Executando busca de hiperparâmetros..."):
-        best_params = optimize_lgbm(X_sample, y_sample)
-    st.success("✅ Otimização concluída")
-    st.json(best_params)
-
-    # Treinamento LGBM
-    model_lgb = LGBMClassifier(**best_params)
-    model_lgb.fit(X_sample, y_sample)
-
-    feature_importance = pd.Series(model_lgb.feature_importances_, index=X_sample.columns)
-    top_lgb_features = feature_importance.sort_values(ascending=False).head(150)
-
-    # Treina rede neural
-    st.subheader("🧠 Treinando Rede Neural para rankeamento final...")
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_sample[top_lgb_features.index])
-    nn = MLPClassifier(hidden_layer_sizes=(64,), max_iter=500, random_state=42)
-    nn.fit(X_scaled, y_sample)
-
-    nn_weights = pd.Series(np.abs(nn.coefs_[0]).sum(axis=1), index=top_lgb_features.index)
-    top_final = nn_weights.sort_values(ascending=False
+    # Histograma com pesos da rede neural
+    st.subheader("📊 Importância das Variáveis via Rede Neural")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    top_100_features.sort_values().plot(kind="barh", ax=ax)
+    ax.set_title("Pesos das Variáveis Selecionadas")
+    ax.set_xlabel("Peso da Rede Neural")
+    st.pyplot(fig)
