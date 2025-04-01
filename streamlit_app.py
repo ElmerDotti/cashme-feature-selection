@@ -8,16 +8,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inicializa autenticação
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+def main():
+    # Login Screen
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
 
-# Mostra tela de login se necessário
-if not st.session_state.authenticated:
-    login_screen()
-else:
-    st.title("🏦 Desafio CashMe - Seleção de Variáveis com Machine Learning")
-    with st.sidebar:
-        st.header("⚙️ Configurações")
-        st.markdown("Este app realiza **seleção automática de variáveis** com ML, LGBM, rede neural e Optuna.")
-    feature_selection_screen()
+    if not st.session_state.authenticated:
+        login_screen()
+    else:
+        st.title("🏦 Desafio CashMe - Seleção de Variáveis com IA")
+        with st.sidebar:
+            st.header("⚙️ Configurações")
+            st.markdown("Este app realiza **seleção automática de variáveis** via LightGBM + Rede Neural.")
+        feature_selection_screen()
+
+if __name__ == "__main__":
+    main()
