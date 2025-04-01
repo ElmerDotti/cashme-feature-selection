@@ -1,29 +1,19 @@
 import streamlit as st
 
-# Usuários e senhas armazenados em dicionário simples (apenas para fins de demonstração)
-USERS = {
-    "admin": "1234",
-    "elmer": "cashme",
-}
-
+# Função principal da tela de login
 def login_screen():
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    st.title("🔐 Desafio CashMe - Autenticação")
 
-    if st.session_state.logged_in:
-        return True
+    with st.form("login_form"):
+        username = st.text_input("Usuário", key="username")
+        password = st.text_input("Senha", type="password", key="password")
 
-    st.title("🔐 Login")
+        login_button = st.form_submit_button("Entrar")
 
-    username = st.text_input("Usuário")
-    password = st.text_input("Senha", type="password")
-
-    if st.button("Entrar"):
-        if USERS.get(username) == password:
-            st.session_state.logged_in = True
+    if login_button:
+        if username == "cashme123" and password == "cashme123":
             st.success("Login realizado com sucesso!")
-            return True
+            st.session_state.authenticated = True
+            st.experimental_rerun()
         else:
-            st.error("Usuário ou senha incorretos.")
-
-    return False
+            st.error("Credenciais inválidas. Tente novamente.")
